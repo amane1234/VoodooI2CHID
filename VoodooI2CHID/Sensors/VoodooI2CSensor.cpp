@@ -13,9 +13,9 @@
 OSDefineMetaClassAndStructors(VoodooI2CSensor, IOService);
 
 IOReturn VoodooI2CSensor::changeState(IOHIDElement* state_element, UInt16 state_usage) {
-    UInt8 index = findPropertyIndex(state_element, state_usage);
+    SInt32 index = findPropertyIndex(state_element, state_usage);
     
-    if (!index)
+    if (index < 0)
         return kIOReturnError;
 
     OSArray* children = state_element->getChildElements();
@@ -31,11 +31,15 @@ IOReturn VoodooI2CSensor::changeState(IOHIDElement* state_element, UInt16 state_
     return kIOReturnSuccess;
 }
 
-UInt8 VoodooI2CSensor::findPropertyIndex(IOHIDElement* element, UInt16 usage) {
+SInt32 VoodooI2CSensor::findPropertyIndex(IOHIDElement* element, UInt16 usage) {
+    if (!element)
+        return -1;
     OSArray* children = element->getChildElements();
+    if (!children)
+        return -1;
     IOHIDElement* child;
 
-    for (UInt8 i = 0; i < children->getCount(); i++) {
+    for (unsigned int i = 1; i < children->getCount(); i++) {
         child = OSDynamicCast(IOHIDElement, children->getObject(i));
 
         if (!child)
@@ -45,7 +49,7 @@ UInt8 VoodooI2CSensor::findPropertyIndex(IOHIDElement* element, UInt16 usage) {
             return i - 1;
     }
 
-    return 0;
+    return -1;
 }
 
 UInt32 VoodooI2CSensor::getElementValue(IOHIDElement* element) {
@@ -64,14 +68,19 @@ void VoodooI2CSensor::handleInterruptReport(AbsoluteTime timestamp, IOMemoryDesc
 }
 
 void VoodooI2CSensor::setElementValue(IOHIDElement* updated_element, UInt32 value) {
-    if (!element)
+    if (!element || !updated_element || !event_driver || !element->getChildElements())
         return;
 
     OSData* buffer = OSData::withCapacity(1);
+    if (!buffer)
+        return;
     bool manufacturer_already_done = false;
     bool model_already_done = false;
     
-    buffer->appendByte(updated_element->getReportID(), 1);
+    if (!buffer->appendByte(updated_element->getReportID(), 1)) {
+        buffer->release();
+        return;
+    }
     
     OSArray* children = element->getChildElements();
 
@@ -106,21 +115,37 @@ void VoodooI2CSensor::setElementValue(IOHIDElement* updated_element, UInt32 valu
         if (element_to_use->getType() != kIOHIDElementTypeFeature)
             continue;
         
-        UInt32 current_value = 0;
+        SInt32 current_value = 0;
         if (child->conformsTo(kHIDPage_Sensor, kHIDUsage_Snsr_Property_ReportingState))
             current_value = findPropertyIndex(child, current_reporting_state);
 
         if (child->conformsTo(kHIDPage_Sensor, kHIDUsage_Snsr_Property_PowerState))
             current_value = findPropertyIndex(child, current_power_state);
 
+        if (current_value < 0 && updated_element != element_to_use) {
+            buffer->release();
+            return;
+        }
         UInt32 value_to_write = (updated_element == element_to_use ? value : current_value);
         
-        buffer->appendBytes(&value_to_write, (element_to_use->getReportSize()/8) * element_to_use->getReportCount());
+        // This workaround serializes scalar, byte-aligned fields only.
+        // Reject unsupported layouts instead of reading beyond value_to_write.
+        UInt32 bits = element_to_use->getReportSize();
+        UInt32 count = element_to_use->getReportCount();
+        if (!bits || bits > 32 || bits % 8 || !count || count > 32 / bits ||
+            !buffer->appendBytes(&value_to_write, (bits / 8) * count)) {
+            IOLog("%s: Cannot serialize sensor feature field safely\n", getName());
+            buffer->release();
+            return;
+        }
     }
 
     IOBufferMemoryDescriptor* report = IOBufferMemoryDescriptor::withBytes(buffer->getBytesNoCopy(), buffer->getLength(), kIODirectionInOut);
 
     buffer->release();
+
+    if (!report)
+        return;
 
     event_driver->setReport(report, kIOHIDReportTypeFeature, updated_element->getReportID());
 
@@ -136,7 +161,7 @@ bool VoodooI2CSensor::start(IOService* provider) {
     if (!event_driver)
         return false;
     
-    OSArray* children = element->getChildElements();
+    OSArray* children = element ? element->getChildElements() : NULL;
     
     if (!children)
         return false;
@@ -157,7 +182,7 @@ bool VoodooI2CSensor::start(IOService* provider) {
         }
     }
     
-    if (!power_state && !reporting_state)
+    if (!power_state || !reporting_state)
         return false;
 
     if (changeState(power_state, kHIDUsage_Snsr_Property_PowerState_D0_FullPower) != kIOReturnSuccess) {
