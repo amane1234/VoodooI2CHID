@@ -20,7 +20,8 @@ bool VoodooI2CHIDDevice::init(OSDictionary* properties) {
     if (!super::init(properties))
         return false;
     awake = true;
-    reset_event = NULL;
+    reset_pending = false;
+    reset_in_progress = false;
     memset(&hid_descriptor, 0, sizeof(VoodooI2CHIDDeviceHIDDescriptor));
     acpi_device = NULL;
     api = NULL;
@@ -120,6 +121,9 @@ IOReturn VoodooI2CHIDDevice::getHIDDescriptorAddress() {
 }
 
 void VoodooI2CHIDDevice::getInputReport() {
+    // Recheck inside the work-loop gate, including callbacks queued before sleep.
+    if (!awake && !reset_pending)
+        return;
     IOBufferMemoryDescriptor* buffer;
     IOReturn ret;
     if (hid_descriptor.wMaxInputLength < 2)
@@ -137,7 +141,10 @@ void VoodooI2CHIDDevice::getInputReport() {
 
     if (!return_size) {
         // IOLog("%s::%s Device sent a 0-length report\n", getName(), name);
-        command_gate->commandWakeup(&reset_event);
+        if (reset_pending) {
+            reset_pending = false;
+            command_gate->commandWakeup(&reset_pending);
+        }
         goto exit;
     }
 
@@ -166,6 +173,23 @@ exit:
 }
 
 IOReturn VoodooI2CHIDDevice::getReport(IOMemoryDescriptor* report, IOHIDReportType reportType, IOOptionBits options) {
+    if (!command_gate)
+        return kIOReturnNotReady;
+    return command_gate->runAction(
+        [](OSObject* owner, void* buffer, void* type, void* flags, void*) -> IOReturn {
+            return static_cast<VoodooI2CHIDDevice*>(owner)->getReportGated(
+                static_cast<IOMemoryDescriptor*>(buffer),
+                static_cast<IOHIDReportType>(reinterpret_cast<uintptr_t>(type)),
+                static_cast<IOOptionBits>(reinterpret_cast<uintptr_t>(flags)));
+        }, report, reinterpret_cast<void*>(static_cast<uintptr_t>(reportType)),
+        reinterpret_cast<void*>(static_cast<uintptr_t>(options)));
+}
+
+IOReturn VoodooI2CHIDDevice::getReportGated(IOMemoryDescriptor* report, IOHIDReportType reportType, IOOptionBits options) {
+    // commandSleep releases the gate while RESET waits for its input ACK.
+    // A feature transaction here could consume that ACK instead.
+    if (!awake || reset_in_progress)
+        return kIOReturnNotReady;
     if (reportType != kIOHIDReportTypeFeature && reportType != kIOHIDReportTypeInput)
         return kIOReturnBadArgument;
 
@@ -225,10 +249,10 @@ IOReturn VoodooI2CHIDDevice::getReport(IOMemoryDescriptor* report, IOHIDReportTy
 }
 
 void VoodooI2CHIDDevice::interruptOccured(OSObject* owner, IOInterruptEventSource* src, int intCount) {
-    if (!awake)
+    if (!awake && !reset_pending)
         return;
 
-    command_gate->attemptAction(OSMemberFunctionCast(IOCommandGate::Action, this, &VoodooI2CHIDDevice::getInputReport));
+    command_gate->runAction(OSMemberFunctionCast(IOCommandGate::Action, this, &VoodooI2CHIDDevice::getInputReport));
 }
 
 VoodooI2CHIDDevice* VoodooI2CHIDDevice::probe(IOService* provider, SInt32* score) {
@@ -271,32 +295,28 @@ VoodooI2CHIDDevice* VoodooI2CHIDDevice::probe(IOService* provider, SInt32* score
 }
 
 void VoodooI2CHIDDevice::releaseResources() {
-    if (command_gate) {
-        command_gate->disable();
-        work_loop->removeEventSource(command_gate);
-        OSSafeReleaseNULL(command_gate);
-    }
-
+    ready_for_input = false;
+    awake = false;
     stopInterrupt();
 
     if (interrupt_simulator) {
-        work_loop->removeEventSource(interrupt_simulator);
+        if (interrupt_simulator->getWorkLoop())
+            interrupt_simulator->getWorkLoop()->removeEventSource(interrupt_simulator);
         OSSafeReleaseNULL(interrupt_simulator);
     }
-
     if (interrupt_source) {
-        work_loop->removeEventSource(interrupt_source);
+        if (interrupt_source->getWorkLoop())
+            interrupt_source->getWorkLoop()->removeEventSource(interrupt_source);
         OSSafeReleaseNULL(interrupt_source);
     }
-
-    if (work_loop) {
-        OSSafeReleaseNULL(work_loop);
+    if (command_gate) {
+        command_gate->disable();
+        if (command_gate->getWorkLoop())
+            command_gate->getWorkLoop()->removeEventSource(command_gate);
+        OSSafeReleaseNULL(command_gate);
     }
-
-    if (acpi_device) {
-        OSSafeReleaseNULL(acpi_device);
-    }
-
+    OSSafeReleaseNULL(work_loop);
+    OSSafeReleaseNULL(acpi_device);
     if (api) {
         if (api->isOpen(this))
             api->close(this);
@@ -305,39 +325,66 @@ void VoodooI2CHIDDevice::releaseResources() {
 }
 
 IOReturn VoodooI2CHIDDevice::resetHIDDevice() {
+    if (!command_gate)
+        return kIOReturnNotReady;
     return command_gate->runAction(OSMemberFunctionCast(IOCommandGate::Action, this, &VoodooI2CHIDDevice::resetHIDDeviceGated));
 }
 
 IOReturn VoodooI2CHIDDevice::resetHIDDeviceGated() {
-    setHIDPowerState(kVoodooI2CStateOn);
+    if (reset_in_progress)
+        return kIOReturnBusy;
 
+    reset_in_progress = true;
+    const bool was_ready = ready_for_input;
+    ready_for_input = false;
+    IOReturn ret = setHIDPowerState(kVoodooI2CStateOn);
     VoodooI2CHIDDeviceCommand command;
+    if (ret != kIOReturnSuccess)
+        goto done;
+
     command.c.reg = hid_descriptor.wCommandRegister;
     command.c.opcode = 0x01;
     command.c.report_type_id = 0;
-
-    api->writeI2C(command.data, 4);
+    // Establish the predicate before RESET can produce an interrupt.
+    reset_pending = true;
+    ret = api->writeI2C(command.data, 4);
+    if (ret != kIOReturnSuccess)
+        goto done;
 
     if (quirks & I2C_HID_QUIRK_NO_IRQ_AFTER_RESET) {
         IOSleep(100);
+        reset_pending = false;
     } else {
-        // Device is required to complete a host-initiated reset in at most 5 seconds. We give it 12 as Linux quirks don't handle some devices.
-
+        // Preserve this driver's 12-second allowance for slow firmware.
         AbsoluteTime absolute_time, deadline;
-        nanoseconds_to_absolutetime(12000000000, &absolute_time);
+        nanoseconds_to_absolutetime(12000000000ULL, &absolute_time);
         clock_absolutetime_interval_to_deadline(absolute_time, &deadline);
-
-        IOReturn sleep = command_gate->commandSleep(&reset_event, deadline, THREAD_UNINT);
-
-        if (sleep == THREAD_TIMED_OUT) {
-            IOLog("%s::%s Timeout waiting for device to complete host initiated reset\n", getName(), name);
-            return kIOReturnTimeout;
-        } else if (sleep == THREAD_AWAKENED) {
-            IOLog("%s::%s Device initiated reset accomplished\n", getName(), name);
+        while (reset_pending) {
+            IOReturn result = command_gate->commandSleep(&reset_pending, deadline, THREAD_UNINT);
+            if (result == THREAD_TIMED_OUT && reset_pending) {
+                ret = kIOReturnTimeout;
+                break;
+            }
+            if (result != THREAD_AWAKENED && result != THREAD_TIMED_OUT) {
+                ret = kIOReturnAborted;
+                break;
+            }
         }
     }
 
-    return kIOReturnSuccess;
+done:
+    reset_pending = false;
+    if (ret != kIOReturnSuccess) {
+        IOLog("%s::%s HID reset failed: 0x%.8x\n", getName(), name, ret);
+        // Best effort only; preserve the original failure for the caller.
+        setHIDPowerState(kVoodooI2CStateOff);
+        awake = false;
+        stopInterrupt();
+    }
+    ready_for_input = was_ready && ret == kIOReturnSuccess;
+    reset_in_progress = false;
+    command_gate->commandWakeup(&reset_in_progress);
+    return ret;
 }
 
 IOReturn VoodooI2CHIDDevice::setHIDPowerState(VoodooI2CState state) {
@@ -351,11 +398,28 @@ IOReturn VoodooI2CHIDDevice::setHIDPowerState(VoodooI2CState state) {
 
         ret = api->writeI2C(command.data, 4);
         IOSleep(100);
-    } while (ret != kIOReturnSuccess && --attempts >= 0);
+    } while (ret != kIOReturnSuccess && --attempts > 0);
     return ret;
 }
 
 IOReturn VoodooI2CHIDDevice::setReport(IOMemoryDescriptor* report, IOHIDReportType reportType, IOOptionBits options) {
+    if (!command_gate)
+        return kIOReturnNotReady;
+    return command_gate->runAction(
+        [](OSObject* owner, void* buffer, void* type, void* flags, void*) -> IOReturn {
+            return static_cast<VoodooI2CHIDDevice*>(owner)->setReportGated(
+                static_cast<IOMemoryDescriptor*>(buffer),
+                static_cast<IOHIDReportType>(reinterpret_cast<uintptr_t>(type)),
+                static_cast<IOOptionBits>(reinterpret_cast<uintptr_t>(flags)));
+        }, report, reinterpret_cast<void*>(static_cast<uintptr_t>(reportType)),
+        reinterpret_cast<void*>(static_cast<uintptr_t>(options)));
+}
+
+IOReturn VoodooI2CHIDDevice::setReportGated(IOMemoryDescriptor* report, IOHIDReportType reportType, IOOptionBits options) {
+    // commandSleep releases the gate while RESET waits for its input ACK.
+    // A feature transaction here could consume that ACK instead.
+    if (!awake || reset_in_progress)
+        return kIOReturnNotReady;
     if (reportType != kIOHIDReportTypeFeature && reportType != kIOHIDReportTypeOutput)
         return kIOReturnBadArgument;
 
@@ -453,31 +517,56 @@ void VoodooI2CHIDDevice::lookupQuirks() {
 IOReturn VoodooI2CHIDDevice::setPowerState(unsigned long whichState, IOService* whatDevice) {
     if (whatDevice != this)
         return kIOReturnInvalid;
-    if (whichState == 0) {
-        if (awake) {
-            setHIDPowerState(kVoodooI2CStateOff);
+    if (!command_gate)
+        return kIOPMAckImplied;
 
-            stopInterrupt();
-
-            IOLog("%s::%s Going to sleep\n", getName(), name);
-            awake = false;
-        }
-    } else {
-        if (!awake) {
-            awake = true;
-
-            startInterrupt();
-
-            if (quirks & I2C_HID_QUIRK_RESET_ON_RESUME) {
-                resetHIDDevice();
-            } else {
-                setHIDPowerState(kVoodooI2CStateOn);
-            }
-
-            IOLog("%s::%s Woke up\n", getName(), name);
-        }
-    }
+    IOReturn ret = command_gate->runAction(
+        [](OSObject* owner, void* state, void*, void*, void*) -> IOReturn {
+            return static_cast<VoodooI2CHIDDevice*>(owner)->setPowerStateGated(
+                static_cast<unsigned long>(reinterpret_cast<uintptr_t>(state)));
+        }, reinterpret_cast<void*>(whichState));
+    setProperty("LastHIDPowerError", static_cast<UInt32>(ret), 32);
+    if (ret != kIOReturnSuccess)
+        IOLog("%s::%s HID power transition failed: 0x%.8x\n", getName(), name, ret);
+    // IOKit interprets positive return values as acknowledgement delays,
+    // not transport errors. The transition is synchronous even on failure.
     return kIOPMAckImplied;
+}
+
+IOReturn VoodooI2CHIDDevice::setPowerStateGated(unsigned long whichState) {
+    // Let an existing RESET finish before changing its power state.
+    while (reset_in_progress) {
+        if (command_gate->commandSleep(&reset_in_progress, THREAD_UNINT) != THREAD_AWAKENED)
+            return kIOReturnAborted;
+    }
+    if (!whichState) {
+        if (!awake)
+            return kIOReturnSuccess;
+        ready_for_input = false;
+        IOReturn ret = kIOReturnSuccess;
+        if (!(quirks & I2C_HID_QUIRK_NO_SLEEP_ON_SUSPEND))
+            ret = setHIDPowerState(kVoodooI2CStateOff);
+        // The provider may power down even if SET_POWER failed.
+        stopInterrupt();
+        awake = false;
+        return ret;
+    }
+    if (awake)
+        return kIOReturnSuccess;
+
+    ready_for_input = false;
+    startInterrupt(); // RESET completion needs interrupts or polling enabled.
+    if (quirks & I2C_HID_QUIRK_DELAY_WAKEUP_AFTER_RESUME)
+        IOSleep(1500);
+    IOReturn ret = (quirks & I2C_HID_QUIRK_RESET_ON_RESUME) ?
+        resetHIDDeviceGated() : setHIDPowerState(kVoodooI2CStateOn);
+    if (ret != kIOReturnSuccess) {
+        stopInterrupt();
+        return ret;
+    }
+    awake = true;
+    ready_for_input = true;
+    return kIOReturnSuccess;
 }
 
 bool VoodooI2CHIDDevice::handleStart(IOService* provider) {
@@ -510,9 +599,9 @@ bool VoodooI2CHIDDevice::handleStart(IOService* provider) {
     }
 
     interrupt_source = IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventAction, this, &VoodooI2CHIDDevice::interruptOccured), api, 0);
-    if (interrupt_source) {
-        work_loop->addEventSource(interrupt_source);
-    } else {
+    if (interrupt_source && work_loop->addEventSource(interrupt_source) != kIOReturnSuccess)
+        OSSafeReleaseNULL(interrupt_source);
+    if (!interrupt_source) {
         IOLog("%s::%s Warning: Could not get interrupt event source, using polling instead\n", getName(), name);
         interrupt_simulator = IOTimerEventSource::timerEventSource(this, OSMemberFunctionCast(IOTimerEventSource::Action, this, &VoodooI2CHIDDevice::simulateInterrupt));
 
@@ -521,12 +610,16 @@ bool VoodooI2CHIDDevice::handleStart(IOService* provider) {
             goto exit;
         }
 
-        work_loop->addEventSource(interrupt_simulator);
+        if (work_loop->addEventSource(interrupt_simulator) != kIOReturnSuccess) {
+            IOLog("%s::%s Could not attach polling timer\n", getName(), name);
+            goto exit;
+        }
     }
     startInterrupt();
 
     lookupQuirks();
-    resetHIDDevice();
+    if (resetHIDDevice() != kIOReturnSuccess)
+        goto exit;
 
 
     PMinit();
@@ -566,9 +659,9 @@ void VoodooI2CHIDDevice::stop(IOService* provider) {
     }
     IOLockUnlock(client_lock);
 
+    PMstop();
     releaseResources();
     OSSafeReleaseNULL(clients);
-    PMstop();
     super::stop(provider);
 }
 
@@ -629,8 +722,10 @@ OSString* VoodooI2CHIDDevice::newManufacturerString() const {
 }
 
 void VoodooI2CHIDDevice::simulateInterrupt(OSObject* owner, IOTimerEventSource* timer) {
+    if (!is_interrupt_started)
+        return;
     AbsoluteTime prev_time = last_multi_touch_event;
-    if (awake) {
+    if (awake || reset_pending) {
         VoodooI2CHIDDevice::getInputReport();
     }
 
@@ -686,10 +781,12 @@ void VoodooI2CHIDDevice::startInterrupt() {
     }
 
     if (interrupt_simulator) {
-        interrupt_simulator->setTimeoutMS(200);
         interrupt_simulator->enable();
+        interrupt_simulator->setTimeoutMS(200);
     } else if (interrupt_source) {
         interrupt_source->enable();
+    } else {
+        return;
     }
     is_interrupt_started = true;
 }
@@ -700,6 +797,7 @@ void VoodooI2CHIDDevice::stopInterrupt() {
     }
 
     if (interrupt_simulator) {
+        interrupt_simulator->cancelTimeout();
         interrupt_simulator->disable();
     } else if (interrupt_source) {
         interrupt_source->disable();
