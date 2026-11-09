@@ -14,6 +14,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/IOInterruptEventSource.h>
+#include <IOKit/IOCommandGate.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/hid/IOHIDDevice.h>
 #include <IOKit/hid/IOHIDElement.h>
@@ -29,6 +30,8 @@
 
 #define I2C_HID_QUIRK_NO_IRQ_AFTER_RESET    BIT(1)
 #define I2C_HID_QUIRK_RESET_ON_RESUME       BIT(5)
+#define I2C_HID_QUIRK_NO_SLEEP_ON_SUSPEND  BIT(6)
+#define I2C_HID_QUIRK_DELAY_WAKEUP_AFTER_RESUME BIT(7)
 
 #define HID_ANY_ID  0xFFFF
 
@@ -85,6 +88,9 @@ static const struct i2c_hid_quirks {
         I2C_HID_QUIRK_RESET_ON_RESUME },
     { I2C_VENDOR_ID_SYNAPTICS, I2C_PRODUCT_ID_SYNAPTICS_SYNA2393,
         I2C_HID_QUIRK_RESET_ON_RESUME },
+    // Same VID/PID-specific power workarounds as Linux i2c-hid.
+    { 0x0488, 0x1063, I2C_HID_QUIRK_NO_SLEEP_ON_SUSPEND }, // Cirque
+    { 0x27c6, 0x0d42, I2C_HID_QUIRK_DELAY_WAKEUP_AFTER_RESUME }, // Goodix
     { 0, 0 }
 };
 
@@ -289,7 +295,11 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
     IOTimerEventSource* interrupt_simulator;
     IOInterruptEventSource* interrupt_source;
     bool ready_for_input;
-    bool* reset_event;
+    bool reset_pending = false;
+    bool reset_in_progress = false;
+    IOReturn getReportGated(IOMemoryDescriptor* report, IOHIDReportType type, IOOptionBits options);
+    IOReturn setReportGated(IOMemoryDescriptor* report, IOHIDReportType type, IOOptionBits options);
+    IOReturn setPowerStateGated(unsigned long whichState);
     bool is_interrupt_started = false;
     UInt32 quirks = 0;
 
