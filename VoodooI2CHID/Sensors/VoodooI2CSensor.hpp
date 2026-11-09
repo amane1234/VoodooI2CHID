@@ -56,7 +56,7 @@ class EXPORT VoodooI2CSensor : public IOService {
     IOHIDElement* reporting_state;
     UInt32 current_reporting_state;
 
-    static UInt8 findPropertyIndex(IOHIDElement* element, UInt16 usage);
+    static SInt32 findPropertyIndex(IOHIDElement* element, UInt16 usage);
     UInt32 getElementValue(IOHIDElement* element);
     void setElementValue(IOHIDElement* element, UInt32 value);
 };
