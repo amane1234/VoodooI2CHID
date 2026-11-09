@@ -53,23 +53,28 @@ IOReturn VoodooI2CSensorHubEnabler::enableHub() {
     params[2] = OSNumber::withNumber(0x1, 8);
     params[3] = OSNumber::withNumber((unsigned long long)0x0, 8);
     
-    provider->evaluateObject("_DSM", &result, params, 4);
-    if (!result)
-        provider->evaluateObject("XDSM", &result, params, 4);
-    if (!result) {
-        IOLog("%s::%s Could not find suitable _DSM or XDSM method in ACPI tables\n", getName(), name);
-        return kIOReturnNotFound;
+    IOReturn status = kIOReturnNoMemory;
+    for (unsigned int i = 0; i < 4; ++i) {
+        if (!params[i])
+            goto cleanup;
     }
-    
-    IOLog("%s::%s Enabled Sensor Hub\n", getName(), name);
-    
-    if (result)
-        result->release();
-    
-    params[0]->release();
-    params[1]->release();
-    params[2]->release();
-    params[3]->release();
-    
-    return kIOReturnSuccess;
+
+    status = provider->evaluateObject("_DSM", &result, params, 4);
+    if (status != kIOReturnSuccess || !result) {
+        OSSafeReleaseNULL(result);
+        status = provider->evaluateObject("XDSM", &result, params, 4);
+    }
+    if (status != kIOReturnSuccess || !result) {
+        IOLog("%s::%s Could not evaluate _DSM or XDSM method in ACPI tables\n", getName(), name);
+        if (status == kIOReturnSuccess)
+            status = kIOReturnNotFound;
+    } else {
+        IOLog("%s::%s Enabled Sensor Hub\n", getName(), name);
+    }
+
+cleanup:
+    OSSafeReleaseNULL(result);
+    for (unsigned int i = 0; i < 4; ++i)
+        OSSafeReleaseNULL(params[i]);
+    return status;
 }
