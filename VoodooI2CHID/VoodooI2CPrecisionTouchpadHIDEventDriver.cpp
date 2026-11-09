@@ -8,10 +8,13 @@
 
 #include "VoodooI2CPrecisionTouchpadHIDEventDriver.hpp"
 
+#include <IOKit/hid/IOHIDInterface.h>
+
 #define super VoodooI2CMultitouchHIDEventDriver
 OSDefineMetaClassAndStructors(VoodooI2CPrecisionTouchpadHIDEventDriver, VoodooI2CMultitouchHIDEventDriver);
 
 void VoodooI2CPrecisionTouchpadHIDEventDriver::enterPrecisionTouchpadMode() {
+    ready = false;
     int retry = 0;
 
     // Wait until input_mode becomes available
@@ -53,15 +56,22 @@ bool VoodooI2CPrecisionTouchpadHIDEventDriver::handleStart(IOService* provider) 
         return false;
 
     if (!digitiser.input_mode)
-        return false;
+        goto fail;
 
     IOLog("%s::%s Putting device into Precision Touchpad Mode\n", getName(), name);
 
     ready = false;
     
     enterPrecisionTouchpadMode();
-
-    return true;
+    if (ready)
+        return true;
+fail:
+    if (hid_interface) {
+        hid_interface->close(this);
+        hid_interface = NULL;
+    }
+    super::handleStop(provider);
+    return false;
 }
 
 IOReturn VoodooI2CPrecisionTouchpadHIDEventDriver::parseElements(UInt32) {
