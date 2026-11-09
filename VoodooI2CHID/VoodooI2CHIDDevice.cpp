@@ -20,8 +20,7 @@ bool VoodooI2CHIDDevice::init(OSDictionary* properties) {
     if (!super::init(properties))
         return false;
     awake = true;
-    bool temp = false;
-    reset_event = &temp;
+    reset_event = NULL;
     memset(&hid_descriptor, 0, sizeof(VoodooI2CHIDDeviceHIDDescriptor));
     acpi_device = NULL;
     api = NULL;
@@ -43,6 +42,7 @@ bool VoodooI2CHIDDevice::init(OSDictionary* properties) {
 }
 
 void VoodooI2CHIDDevice::free() {
+    OSSafeReleaseNULL(clients);
     if (client_lock)
         IOLockFree(client_lock);
 
@@ -122,11 +122,18 @@ IOReturn VoodooI2CHIDDevice::getHIDDescriptorAddress() {
 void VoodooI2CHIDDevice::getInputReport() {
     IOBufferMemoryDescriptor* buffer;
     IOReturn ret;
+    if (hid_descriptor.wMaxInputLength < 2)
+        return;
+
     unsigned char* report = (unsigned char *)IOMalloc(hid_descriptor.wMaxInputLength);
+    if (!report)
+        return;
 
-    api->readI2C(report, hid_descriptor.wMaxInputLength);
+    int return_size;
+    if (api->readI2C(report, hid_descriptor.wMaxInputLength) != kIOReturnSuccess)
+        goto exit;
 
-    int return_size = report[0] | report[1] << 8;
+    return_size = report[0] | report[1] << 8;
 
     if (!return_size) {
         // IOLog("%s::%s Device sent a 0-length report\n", getName(), name);
@@ -137,12 +144,14 @@ void VoodooI2CHIDDevice::getInputReport() {
     if (!ready_for_input)
         goto exit;
 
-    if (return_size > hid_descriptor.wMaxInputLength) {
+    if (return_size <= 2 || return_size > hid_descriptor.wMaxInputLength) {
         // IOLog("%s: Incomplete report %d/%d\n", getName(), hid_descriptor.wMaxInputLength, return_size);
         goto exit;
     }
 
-    buffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, 0, return_size);
+    buffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, 0, return_size - 2);
+    if (!buffer)
+        goto exit;
     buffer->writeBytes(0, report + 2, return_size - 2);
 
     ret = handleReport(buffer, kIOHIDReportTypeInput);
@@ -160,6 +169,9 @@ IOReturn VoodooI2CHIDDevice::getReport(IOMemoryDescriptor* report, IOHIDReportTy
     if (reportType != kIOHIDReportTypeFeature && reportType != kIOHIDReportTypeInput)
         return kIOReturnBadArgument;
 
+    if (!report || !report->getLength() || report->getLength() > 0xFFFF - 2)
+        return kIOReturnBadArgument;
+
     UInt8 args[3];
     IOReturn ret;
     int args_len = 0;
@@ -168,6 +180,8 @@ IOReturn VoodooI2CHIDDevice::getReport(IOMemoryDescriptor* report, IOHIDReportTy
     UInt8 raw_report_type = (reportType == kIOHIDReportTypeFeature) ? 0x03 : 0x01;
 
     UInt8* buffer = (UInt8*)IOMalloc(report->getLength()+2);
+    if (!buffer)
+        return kIOReturnNoMemory;
 
 
     if (report_id >= 0x0F) {
@@ -181,6 +195,10 @@ IOReturn VoodooI2CHIDDevice::getReport(IOMemoryDescriptor* report, IOHIDReportTy
     UInt8 length = 4;
 
     VoodooI2CHIDDeviceCommand* command = (VoodooI2CHIDDeviceCommand*)IOMalloc(4 + args_len);
+    if (!command) {
+        IOFree(buffer, report->getLength()+2);
+        return kIOReturnNoMemory;
+    }
     memset(command, 0, 4+args_len);
     command->c.reg = hid_descriptor.wCommandRegister;
     command->c.opcode = 0x02;
@@ -192,7 +210,13 @@ IOReturn VoodooI2CHIDDevice::getReport(IOMemoryDescriptor* report, IOHIDReportTy
     length += args_len;
     ret = api->writeReadI2C(raw_command, length, buffer, report->getLength()+2);
 
-    report->writeBytes(0, buffer+2, report->getLength());
+    if (ret == kIOReturnSuccess) {
+        UInt16 response_length = buffer[0] | (buffer[1] << 8);
+        if (response_length < 2 || response_length > report->getLength() + 2)
+            ret = kIOReturnIOError;
+        else if (report->writeBytes(0, buffer + 2, response_length - 2) != response_length - 2)
+            ret = kIOReturnIOError;
+    }
 
     IOFree(buffer, report->getLength()+2);
     IOFree(command, 4+args_len);
@@ -335,6 +359,10 @@ IOReturn VoodooI2CHIDDevice::setReport(IOMemoryDescriptor* report, IOHIDReportTy
     if (reportType != kIOHIDReportTypeFeature && reportType != kIOHIDReportTypeOutput)
         return kIOReturnBadArgument;
 
+    // Reserve room for command, extended ID, data register and length.
+    if (!report || !report->getLength() || report->getLength() > 0xFFFF - 10)
+        return kIOReturnBadArgument;
+
     UInt16 data_register = hid_descriptor.wDataRegister;
     UInt8 raw_report_type = (reportType == kIOHIDReportTypeFeature) ? 0x03 : 0x02;
     UInt8 idx = 0;
@@ -343,10 +371,15 @@ IOReturn VoodooI2CHIDDevice::setReport(IOMemoryDescriptor* report, IOHIDReportTy
     UInt8 report_id = options & 0xFF;
     UInt16 report_length = report->getLength();
     UInt8* buffer = (UInt8*)IOMalloc(report_length);
+    if (!buffer)
+        return kIOReturnNoMemory;
     UInt8* orig_buffer = buffer;
     
-    report->readBytes(0, buffer, report_length);
-    if(report_id == buffer[0]){
+    if (report->readBytes(0, buffer, report_length) != report_length) {
+        IOFree(orig_buffer, report->getLength());
+        return kIOReturnIOError;
+    }
+    if (report_id && report_id == buffer[0]) {
         buffer++;
         report_length--;
     }
@@ -359,12 +392,15 @@ IOReturn VoodooI2CHIDDevice::setReport(IOMemoryDescriptor* report, IOHIDReportTy
     size                                            /* args */;
 
     UInt8* arguments = (UInt8*)IOMalloc(arguments_length);
+    if (!arguments) {
+        IOFree(orig_buffer, report->getLength());
+        return kIOReturnNoMemory;
+    }
     memset(arguments, 0, arguments_length);
 
-    if (report_id >= 0x0F) {
+    const UInt8 command_report_id = report_id >= 0x0F ? 0x0F : report_id;
+    if (report_id >= 0x0F)
         arguments[idx++] = report_id;
-        report_id = 0x0F;
-    }
 
     arguments[idx++] = data_register & 0xFF;
     arguments[idx++] = data_register >> 8;
@@ -377,13 +413,18 @@ IOReturn VoodooI2CHIDDevice::setReport(IOMemoryDescriptor* report, IOHIDReportTy
 
     memcpy(&arguments[idx], buffer, report_length);
 
-    UInt8 length = 4;
+    UInt16 length = 4;
 
     VoodooI2CHIDDeviceCommand* command = (VoodooI2CHIDDeviceCommand*)IOMalloc(4 + arguments_length);
+    if (!command) {
+        IOFree(arguments, arguments_length);
+        IOFree(orig_buffer, report->getLength());
+        return kIOReturnNoMemory;
+    }
     memset(command, 0, 4+arguments_length);
     command->c.reg = hid_descriptor.wCommandRegister;
     command->c.opcode = 0x03;
-    command->c.report_type_id = report_id | raw_report_type << 4;
+    command->c.report_type_id = command_report_id | raw_report_type << 4;
 
     UInt8* raw_command = (UInt8*)command;
 
@@ -444,6 +485,10 @@ bool VoodooI2CHIDDevice::handleStart(IOService* provider) {
         return false;
     }
 
+    // releaseResources also runs on early startup failures.
+    acpi_device->retain();
+    api->retain();
+
     work_loop = getWorkLoop();
 
     if (!work_loop) {
@@ -458,9 +503,6 @@ bool VoodooI2CHIDDevice::handleStart(IOService* provider) {
         IOLog("%s::%s Could not open command gate\n", getName(), name);
         goto exit;
     }
-
-    acpi_device->retain();
-    api->retain();
 
     if (!api->open(this)) {
         IOLog("%s::%s Could not open API\n", getName(), name);
@@ -540,6 +582,8 @@ IOReturn VoodooI2CHIDDevice::newReportDescriptor(IOMemoryDescriptor** descriptor
     command.c.reg = hid_descriptor.wReportDescRegister;
 
     UInt8* buffer = reinterpret_cast<UInt8*>(IOMalloc(hid_descriptor.wReportDescLength));
+    if (!buffer)
+        return kIOReturnNoMemory;
     memset(buffer, 0, hid_descriptor.wReportDescLength);
 
     if (api->writeReadI2C(command.data, 2, buffer, hid_descriptor.wReportDescLength) != kIOReturnSuccess) {
@@ -552,6 +596,7 @@ IOReturn VoodooI2CHIDDevice::newReportDescriptor(IOMemoryDescriptor** descriptor
 
     if (!report_descriptor) {
         IOLog("%s::%s Could not allocated buffer for report descriptor\n", getName(), name);
+        IOFree(buffer, hid_descriptor.wReportDescLength);
         return kIOReturnNoResources;
     }
 
@@ -611,7 +656,7 @@ void VoodooI2CHIDDevice::simulateInterrupt(OSObject* owner, IOTimerEventSource* 
 bool VoodooI2CHIDDevice::open(IOService *forClient, IOOptionBits options, void *arg) {
     IOLockLock(client_lock);
     clients->setObject(forClient);
-    IOUnlock(client_lock);
+    IOLockUnlock(client_lock);
 
     return super::open(forClient, options, arg);
 }
@@ -628,7 +673,7 @@ void VoodooI2CHIDDevice::close(IOService *forClient, IOOptionBits options) {
         }
     }
 
-    IOUnlock(client_lock);
+    IOLockUnlock(client_lock);
 
     IOLockWakeup(client_lock, &client_lock, true);
 
