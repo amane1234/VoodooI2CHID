@@ -24,7 +24,8 @@ IOFramebuffer* VoodooI2CAccelerometerSensor::getFramebuffer() {
         
         if (display) {
             IOLog("%s::Got active display\n", getName());
-            IORegistryEntry *entry = display->getParentEntry(gIOServicePlane)->getParentEntry(gIOServicePlane);
+            IORegistryEntry *parent = display->getParentEntry(gIOServicePlane);
+            IORegistryEntry *entry = parent ? parent->getParentEntry(gIOServicePlane) : NULL;
             if (entry)
                 framebuffer = reinterpret_cast<IOFramebuffer*>(entry->metaCast("IOFramebuffer"));
             if (framebuffer)
@@ -43,15 +44,27 @@ void VoodooI2CAccelerometerSensor::handleInterruptReport(AbsoluteTime timestamp,
     if (!x_axis || !y_axis || !z_axis)
         return;
     
-    if (x_axis->getReportID() != report_id)
+    if (report_type != kIOHIDReportTypeInput || x_axis->getReportID() != report_id ||
+        y_axis->getReportID() != report_id || z_axis->getReportID() != report_id)
         return;
 
     if (!active_framebuffer)
         active_framebuffer = getFramebuffer();
     
-    SInt16 x_axis_value = *(SInt16*)x_axis->getDataValue()->getBytesNoCopy();
-    SInt16 y_axis_value = *(SInt16*)y_axis->getDataValue()->getBytesNoCopy();
-    SInt16 z_axis_value = *(SInt16*)z_axis->getDataValue()->getBytesNoCopy();
+    OSData* x_data = x_axis->getDataValue();
+    OSData* y_data = y_axis->getDataValue();
+    OSData* z_data = z_axis->getDataValue();
+    if (!x_data || !y_data || !z_data ||
+        x_data->getLength() < sizeof(SInt16) ||
+        y_data->getLength() < sizeof(SInt16) ||
+        z_data->getLength() < sizeof(SInt16))
+        return;
+
+    // memcpy also handles unaligned element data.
+    SInt16 x_axis_value, y_axis_value, z_axis_value;
+    memcpy(&x_axis_value, x_data->getBytesNoCopy(), sizeof(x_axis_value));
+    memcpy(&y_axis_value, y_data->getBytesNoCopy(), sizeof(y_axis_value));
+    memcpy(&z_axis_value, z_data->getBytesNoCopy(), sizeof(z_axis_value));
 
     UInt16 x_axis_absolute = x_axis_value >= 0 ? x_axis_value : -x_axis_value;
     UInt16 y_axis_absolute = y_axis_value >= 0 ? y_axis_value : -y_axis_value;
