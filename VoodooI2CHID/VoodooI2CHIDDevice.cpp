@@ -173,21 +173,17 @@ exit:
 }
 
 IOReturn VoodooI2CHIDDevice::getReport(IOMemoryDescriptor* report, IOHIDReportType reportType, IOOptionBits options) {
+    // Deliberately not run through command_gate: IOHIDDevice calls getReport()/setReport() with its
+    // element lock held, while getInputReport() holds the gate and then takes that same lock in
+    // handleReport(). Gating here deadlocks as soon as an input report arrives during a feature
+    // transfer. The I2C transfers themselves are serialised by the controller.
     if (!command_gate)
         return kIOReturnNotReady;
-    return command_gate->runAction(
-        [](OSObject* owner, void* buffer, void* type, void* flags, void*) -> IOReturn {
-            return static_cast<VoodooI2CHIDDevice*>(owner)->getReportGated(
-                static_cast<IOMemoryDescriptor*>(buffer),
-                static_cast<IOHIDReportType>(reinterpret_cast<uintptr_t>(type)),
-                static_cast<IOOptionBits>(reinterpret_cast<uintptr_t>(flags)));
-        }, report, reinterpret_cast<void*>(static_cast<uintptr_t>(reportType)),
-        reinterpret_cast<void*>(static_cast<uintptr_t>(options)));
+    return getReportGated(report, reportType, options);
 }
 
 IOReturn VoodooI2CHIDDevice::getReportGated(IOMemoryDescriptor* report, IOHIDReportType reportType, IOOptionBits options) {
-    // commandSleep releases the gate while RESET waits for its input ACK.
-    // A feature transaction here could consume that ACK instead.
+    // A feature transaction during RESET could consume the device's reset ACK, so refuse it.
     if (!awake || reset_in_progress)
         return kIOReturnNotReady;
     if (reportType != kIOHIDReportTypeFeature && reportType != kIOHIDReportTypeInput)
@@ -362,7 +358,9 @@ IOReturn VoodooI2CHIDDevice::resetHIDDeviceGated() {
         while (reset_pending) {
             IOReturn result = command_gate->commandSleep(&reset_pending, deadline, THREAD_UNINT);
             if (result == THREAD_TIMED_OUT && reset_pending) {
-                ret = kIOReturnTimeout;
+                // Like Linux i2c-hid (and this driver before), a missing reset ACK is not fatal:
+                // plenty of devices never send it but work fine afterwards.
+                IOLog("%s::%s Timeout waiting for device to complete host initiated reset, continuing\n", getName(), name);
                 break;
             }
             if (result != THREAD_AWAKENED && result != THREAD_TIMED_OUT) {
@@ -403,21 +401,14 @@ IOReturn VoodooI2CHIDDevice::setHIDPowerState(VoodooI2CState state) {
 }
 
 IOReturn VoodooI2CHIDDevice::setReport(IOMemoryDescriptor* report, IOHIDReportType reportType, IOOptionBits options) {
+    // Not gated, for the same lock-order reason as getReport()
     if (!command_gate)
         return kIOReturnNotReady;
-    return command_gate->runAction(
-        [](OSObject* owner, void* buffer, void* type, void* flags, void*) -> IOReturn {
-            return static_cast<VoodooI2CHIDDevice*>(owner)->setReportGated(
-                static_cast<IOMemoryDescriptor*>(buffer),
-                static_cast<IOHIDReportType>(reinterpret_cast<uintptr_t>(type)),
-                static_cast<IOOptionBits>(reinterpret_cast<uintptr_t>(flags)));
-        }, report, reinterpret_cast<void*>(static_cast<uintptr_t>(reportType)),
-        reinterpret_cast<void*>(static_cast<uintptr_t>(options)));
+    return setReportGated(report, reportType, options);
 }
 
 IOReturn VoodooI2CHIDDevice::setReportGated(IOMemoryDescriptor* report, IOHIDReportType reportType, IOOptionBits options) {
-    // commandSleep releases the gate while RESET waits for its input ACK.
-    // A feature transaction here could consume that ACK instead.
+    // A feature transaction during RESET could consume the device's reset ACK, so refuse it.
     if (!awake || reset_in_progress)
         return kIOReturnNotReady;
     if (reportType != kIOHIDReportTypeFeature && reportType != kIOHIDReportTypeOutput)
@@ -515,8 +506,9 @@ void VoodooI2CHIDDevice::lookupQuirks() {
 }
 
 IOReturn VoodooI2CHIDDevice::setPowerState(unsigned long whichState, IOService* whatDevice) {
+    // The return value is an acknowledgement delay in microseconds, not an IOReturn
     if (whatDevice != this)
-        return kIOReturnInvalid;
+        return kIOPMAckImplied;
     if (!command_gate)
         return kIOPMAckImplied;
 
