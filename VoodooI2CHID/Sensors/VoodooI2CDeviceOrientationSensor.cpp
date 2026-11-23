@@ -52,20 +52,29 @@ bool VoodooI2CDeviceOrientationSensor::start(IOService* provider) {
 
 VoodooI2CSensor* VoodooI2CDeviceOrientationSensor::withElement(IOHIDElement* sensor_element, IOService* event_driver) {
     VoodooI2CSensor* sensor = OSTypeAlloc(VoodooI2CDeviceOrientationSensor);
-    
     OSDictionary* dictionary = OSDictionary::withCapacity(1);
-    
+
+    if (!sensor || !dictionary) {
+        OSSafeReleaseNULL(sensor);
+        OSSafeReleaseNULL(dictionary);
+        return NULL;
+    }
+
     dictionary->setObject("HID Element", sensor_element);
-    
+
     sensor->element = sensor_element;
-    
+
+    bool attached = false;
     if (!sensor->init(dictionary) ||
-        !sensor->attach(event_driver) ||
+        !(attached = sensor->attach(event_driver)) ||
         !sensor->start(event_driver)) {
+        // An attached sensor stays in the registry (which holds its own reference) unless detached
+        if (attached)
+            sensor->detach(event_driver);
         OSSafeReleaseNULL(sensor);
     }
-    
+
     dictionary->release();
-    
+
     return sensor;
 }

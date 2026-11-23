@@ -211,8 +211,9 @@ void VoodooI2CSensor::stop(IOService* provider) {
 }
 
 IOReturn VoodooI2CSensor::setPowerState(unsigned long whichState, IOService* whatDevice) {
+    // The return value is an acknowledgement delay in microseconds, not an IOReturn
     if (whatDevice != this)
-        return kIOReturnInvalid;
+        return kIOPMAckImplied;
     if (whichState == 0) {
         if (awake) {
             awake = false;
@@ -255,19 +256,28 @@ IOReturn VoodooI2CSensor::setPowerState(unsigned long whichState, IOService* wha
 
 VoodooI2CSensor* VoodooI2CSensor::withElement(IOHIDElement* sensor_element, IOService* event_driver) {
     VoodooI2CSensor* sensor = OSTypeAlloc(VoodooI2CSensor);
-    
     OSDictionary* dictionary = OSDictionary::withCapacity(1);
-    
+
+    if (!sensor || !dictionary) {
+        OSSafeReleaseNULL(sensor);
+        OSSafeReleaseNULL(dictionary);
+        return NULL;
+    }
+
     dictionary->setObject("HID Element", sensor_element);
-    
+
     sensor->element = sensor_element;
 
+    bool attached = false;
     if (!sensor->init(dictionary) ||
-        !sensor->attach(event_driver) ||
+        !(attached = sensor->attach(event_driver)) ||
         !sensor->start(event_driver)) {
+        // An attached sensor stays in the registry (which holds its own reference) unless detached
+        if (attached)
+            sensor->detach(event_driver);
         OSSafeReleaseNULL(sensor);
     }
-    
+
     dictionary->release();
 
     return sensor;

@@ -641,13 +641,16 @@ bool VoodooI2CHIDDevice::start(IOService* provider) {
 }
 
 void VoodooI2CHIDDevice::stop(IOService* provider) {
+    // Give the clients time to close, but never wait forever: a client that does not close would
+    // otherwise hang termination, and with it sleep or shutdown.
+    AbsoluteTime deadline;
+    clock_interval_to_deadline(5000, kMillisecondScale, &deadline);
     IOLockLock(client_lock);
-    for(;;) {
-        if (!clients->getCount()) {
+    while (clients && clients->getCount()) {
+        if (IOLockSleepDeadline(client_lock, &client_lock, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
+            IOLog("%s::%s %u client(s) still open, stopping anyway\n", getName(), name, clients->getCount());
             break;
         }
-
-        IOLockSleep(client_lock, &client_lock, THREAD_UNINT);
     }
     IOLockUnlock(client_lock);
 
@@ -741,11 +744,17 @@ void VoodooI2CHIDDevice::simulateInterrupt(OSObject* owner, IOTimerEventSource* 
 }
 
 bool VoodooI2CHIDDevice::open(IOService *forClient, IOOptionBits options, void *arg) {
+    // Only track clients whose open succeeded, and each one once: stop() waits until every tracked
+    // client has closed, so a failed or repeated open used to leave an entry behind and hang termination.
+    if (!super::open(forClient, options, arg))
+        return false;
+
     IOLockLock(client_lock);
-    clients->setObject(forClient);
+    if (clients && clients->getNextIndexOfObject(forClient, 0) == (unsigned int)-1)
+        clients->setObject(forClient);
     IOLockUnlock(client_lock);
 
-    return super::open(forClient, options, arg);
+    return true;
 }
 
 void VoodooI2CHIDDevice::close(IOService *forClient, IOOptionBits options) {

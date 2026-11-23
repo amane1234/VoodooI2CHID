@@ -95,8 +95,9 @@ IOReturn VoodooI2CPrecisionTouchpadHIDEventDriver::parseElements(UInt32) {
 }
 
 IOReturn VoodooI2CPrecisionTouchpadHIDEventDriver::setPowerState(unsigned long whichState, IOService* whatDevice) {
+    // The return value is an acknowledgement delay in microseconds, not an IOReturn
     if (whatDevice != this)
-        return kIOReturnInvalid;
+        return kIOPMAckImplied;
     if (!whichState) {
         if (awake)
             awake = false;
