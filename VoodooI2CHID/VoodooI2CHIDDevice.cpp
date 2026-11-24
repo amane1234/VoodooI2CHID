@@ -156,6 +156,26 @@ void VoodooI2CHIDDevice::getInputReport() {
         goto exit;
     }
 
+    /*
+     * Polling idle back-off for event drivers that do not update
+     * last_multi_touch_event themselves (e.g. AlpsHID). Treat a report whose
+     * content changed as touch activity, so simulateInterrupt() can drop to
+     * INTERRUPT_SIMULATOR_TIMEOUT_IDLE after 1.5 s without changes instead of
+     * reading every INTERRUPT_SIMULATOR_TIMEOUT ms forever.
+     */
+    {
+        static UInt8 poll_last[64];
+        static int poll_last_len = 0;
+        int n = return_size < (int)sizeof(poll_last) ? return_size : (int)sizeof(poll_last);
+        if (n != poll_last_len || memcmp(poll_last, report, n) != 0) {
+            AbsoluteTime poll_now;
+            clock_get_uptime(&poll_now);
+            last_multi_touch_event = poll_now;
+            memcpy(poll_last, report, n);
+            poll_last_len = n;
+        }
+    }
+
     buffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, 0, return_size - 2);
     if (!buffer)
         goto exit;
