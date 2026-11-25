@@ -19,10 +19,8 @@
 #include <IOKit/hid/IOHIDDevice.h>
 #include <IOKit/hid/IOHIDElement.h>
 #include "../../../Dependencies/helpers.hpp"
+#include "VoodooI2CHIDProtocol.hpp"
 
-#define INTERRUPT_SIMULATOR_TIMEOUT 5
-#define INTERRUPT_SIMULATOR_TIMEOUT_BUSY 2
-#define INTERRUPT_SIMULATOR_TIMEOUT_IDLE 50
 
 #define I2C_HID_PWR_ON  0x00
 #define I2C_HID_PWR_SLEEP 0x01
@@ -49,31 +47,6 @@
 
 #define EXPORT __attribute__((visibility("default")))
 
-typedef union {
-    UInt8 data[4];
-    struct __attribute__((__packed__)) cmd {
-        UInt16 reg;
-        UInt8 report_type_id;
-        UInt8 opcode;
-    } c;
-} VoodooI2CHIDDeviceCommand;
-
-typedef struct __attribute__((__packed__)) {
-    UInt16 wHIDDescLength;
-    UInt16 bcdVersion;
-    UInt16 wReportDescLength;
-    UInt16 wReportDescRegister;
-    UInt16 wInputRegister;
-    UInt16 wMaxInputLength;
-    UInt16 wOutputRegister;
-    UInt16 wMaxOutputLength;
-    UInt16 wCommandRegister;
-    UInt16 wDataRegister;
-    UInt16 wVendorID;
-    UInt16 wProductID;
-    UInt16 wVersionID;
-    UInt32 reserved;
-} VoodooI2CHIDDeviceHIDDescriptor;
 
 static const struct i2c_hid_quirks {
     UInt16 idVendor;

@@ -22,3 +22,7 @@ xcuserdata/
 *.xccheckout
 *.xcscmblueprint
 *.DS_Store
+Tests/build/
+Tests/crash-*
+Tests/leak-*
+Tests/timeout-*
