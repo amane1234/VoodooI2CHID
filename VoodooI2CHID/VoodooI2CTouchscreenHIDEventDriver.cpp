@@ -153,12 +153,17 @@ bool VoodooI2CTouchscreenHIDEventDriver::checkStylus(AbsoluteTime timestamp, Voo
     if (!event.transducers)
         return false;
 
-    for (int index = 0, count = event.transducers->getCount(); index < count; index++) {
-        VoodooI2CDigitiserTransducer* transducer = OSDynamicCast(VoodooI2CDigitiserTransducer, event.transducers->getObject(index));
+    // parseElements() puts the only stylus at index zero in our own array.
+    // A caller supplying its own transducers may use a different order.
+    unsigned int count = event.transducers->getCount();
+    if (event.transducers == digitiser.transducers && count > 1)
+        count = 1;
 
-        if (transducer && transducer->type == kDigitiserTransducerStylus && transducer->in_range &&
-            transducer->logical_max_x > 0 && transducer->logical_max_y > 0) {
-            VoodooI2CDigitiserStylus* stylus = (VoodooI2CDigitiserStylus*)transducer;
+    for (unsigned int index = 0; index < count; ++index) {
+        auto* stylus = OSDynamicCast(VoodooI2CDigitiserStylus, event.transducers->getObject(index));
+
+        if (stylus && stylus->type == kDigitiserTransducerStylus && stylus->in_range &&
+            stylus->logical_max_x > 0 && stylus->logical_max_y > 0) {
             IOFixed x = ((stylus->coordinates.x.value() * 1.0f) / stylus->logical_max_x) * 65535;
             IOFixed y = ((stylus->coordinates.y.value() * 1.0f) / stylus->logical_max_y) * 65535;
             IOFixed z = stylus->logical_max_z > 0 ? ((stylus->coordinates.z.value() * 1.0f) / stylus->logical_max_z) * 65535 : 0;
@@ -260,9 +265,14 @@ void VoodooI2CTouchscreenHIDEventDriver::forwardReport(VoodooI2CMultitouchEvent 
     }
 
     if (active_framebuffer) {
-        OSNumber* number = OSDynamicCast(OSNumber, active_framebuffer->getProperty(kIOFBTransformKey));
-        current_rotation = number ? number->unsigned8BitValue() / 0x10 : 0;
-        multitouch_interface->setProperty(kIOFBTransformKey, current_rotation, 8);
+        OSObject* transform = active_framebuffer->copyProperty(kIOFBTransformKey);
+        OSNumber* number = OSDynamicCast(OSNumber, transform);
+        const UInt8 rotation = number ? number->unsigned8BitValue() / 0x10 : 0;
+        OSSafeReleaseNULL(transform);
+        if (!rotation_published || rotation != current_rotation) {
+            current_rotation = rotation;
+            rotation_published = multitouch_interface->setProperty(kIOFBTransformKey, rotation, 8);
+        }
     }
     
     if (event.contact_count) {
@@ -295,6 +305,7 @@ void VoodooI2CTouchscreenHIDEventDriver::forwardReport(VoodooI2CMultitouchEvent 
 }
 
 bool VoodooI2CTouchscreenHIDEventDriver::handleStart(IOService* provider) {
+    rotation_published = false;
     if (!super::handleStart(provider))
         return false;
     

@@ -202,6 +202,25 @@ IOReturn VoodooI2CHIDDevice::getReport(IOMemoryDescriptor* report, IOHIDReportTy
     return getReportGated(report, reportType, options);
 }
 
+// Register, type/ID, opcode, optional extended ID, and data register.
+static const unsigned int maxReportCommandLength = sizeof(VoodooI2CHIDDeviceCommand) + 3;
+
+static UInt16 encodeReportCommand(UInt8* bytes, const VoodooI2CHIDDeviceHIDDescriptor& descriptor,
+                                  UInt8 opcode, UInt8 report_type, UInt8 report_id) {
+    VoodooI2CHIDDeviceCommand command;
+    command.c.reg = descriptor.wCommandRegister;
+    command.c.report_type_id = (report_type << 4) | (report_id < 0x0F ? report_id : 0x0F);
+    command.c.opcode = opcode;
+    memcpy(bytes, command.data, sizeof(command));
+
+    UInt16 length = sizeof(command);
+    if (report_id >= 0x0F)
+        bytes[length++] = report_id;
+    bytes[length++] = descriptor.wDataRegister & 0xFF;
+    bytes[length++] = descriptor.wDataRegister >> 8;
+    return length;
+}
+
 IOReturn VoodooI2CHIDDevice::getReportGated(IOMemoryDescriptor* report, IOHIDReportType reportType, IOOptionBits options) {
     // A feature transaction during RESET could consume the device's reset ACK, so refuse it.
     if (!awake || reset_in_progress)
@@ -209,58 +228,28 @@ IOReturn VoodooI2CHIDDevice::getReportGated(IOMemoryDescriptor* report, IOHIDRep
     if (reportType != kIOHIDReportTypeFeature && reportType != kIOHIDReportTypeInput)
         return kIOReturnBadArgument;
 
-    if (!report || !report->getLength() || report->getLength() > 0xFFFF - 2)
+    const IOByteCount report_length = report ? report->getLength() : 0;
+    if (!report_length || report_length > 0xFFFF - 2)
         return kIOReturnBadArgument;
 
-    UInt8 args[3];
-    IOReturn ret;
-    int args_len = 0;
-    UInt16 read_register = hid_descriptor.wDataRegister;
-    UInt8 report_id = options & 0xFF;
-    UInt8 raw_report_type = (reportType == kIOHIDReportTypeFeature) ? 0x03 : 0x01;
-
-    UInt8* buffer = (UInt8*)IOMalloc(report->getLength()+2);
+    const UInt16 read_length = static_cast<UInt16>(report_length + 2);
+    UInt8* buffer = static_cast<UInt8*>(IOMalloc(read_length));
     if (!buffer)
         return kIOReturnNoMemory;
 
-
-    if (report_id >= 0x0F) {
-        args[args_len++] = report_id;
-        report_id = 0x0F;
-    }
-
-    args[args_len++] = read_register & 0xFF;
-    args[args_len++] = read_register >> 8;
-
-    UInt8 length = 4;
-
-    VoodooI2CHIDDeviceCommand* command = (VoodooI2CHIDDeviceCommand*)IOMalloc(4 + args_len);
-    if (!command) {
-        IOFree(buffer, report->getLength()+2);
-        return kIOReturnNoMemory;
-    }
-    memset(command, 0, 4+args_len);
-    command->c.reg = hid_descriptor.wCommandRegister;
-    command->c.opcode = 0x02;
-    command->c.report_type_id = report_id | raw_report_type << 4;
-
-    UInt8* raw_command = (UInt8*)command;
-
-    memcpy(raw_command + length, args, args_len);
-    length += args_len;
-    ret = api->writeReadI2C(raw_command, length, buffer, report->getLength()+2);
-
+    UInt8 command[maxReportCommandLength];
+    const UInt8 raw_type = reportType == kIOHIDReportTypeFeature ? 0x03 : 0x01;
+    const UInt16 command_length = encodeReportCommand(command, hid_descriptor, 0x02, raw_type, options & 0xFF);
+    IOReturn ret = api->writeReadI2C(command, command_length, buffer, read_length);
     if (ret == kIOReturnSuccess) {
         UInt16 response_length = buffer[0] | (buffer[1] << 8);
-        if (response_length < 2 || response_length > report->getLength() + 2)
+        if (response_length < 2 || response_length > read_length)
             ret = kIOReturnIOError;
-        else if (report->writeBytes(0, buffer + 2, response_length - 2) != response_length - 2)
+        else if (report->writeBytes(0, buffer + 2, response_length - 2) != static_cast<IOByteCount>(response_length - 2))
             ret = kIOReturnIOError;
     }
 
-    IOFree(buffer, report->getLength()+2);
-    IOFree(command, 4+args_len);
-
+    IOFree(buffer, read_length);
     return ret;
 }
 
@@ -434,83 +423,41 @@ IOReturn VoodooI2CHIDDevice::setReportGated(IOMemoryDescriptor* report, IOHIDRep
     if (reportType != kIOHIDReportTypeFeature && reportType != kIOHIDReportTypeOutput)
         return kIOReturnBadArgument;
 
+    const IOByteCount report_length = report ? report->getLength() : 0;
     // Reserve room for command, extended ID, data register and length.
-    if (!report || !report->getLength() || report->getLength() > 0xFFFF - 10)
+    if (!report_length || report_length > 0xFFFF - 10)
         return kIOReturnBadArgument;
 
-    UInt16 data_register = hid_descriptor.wDataRegister;
-    UInt8 raw_report_type = (reportType == kIOHIDReportTypeFeature) ? 0x03 : 0x02;
-    UInt8 idx = 0;
-    UInt16 size;
-    UInt16 arguments_length;
-    UInt8 report_id = options & 0xFF;
-    UInt16 report_length = report->getLength();
-    UInt8* buffer = (UInt8*)IOMalloc(report_length);
-    if (!buffer)
+    const UInt8 report_id = options & 0xFF;
+    const UInt8 raw_type = reportType == kIOHIDReportTypeFeature ? 0x03 : 0x02;
+    UInt8 header[maxReportCommandLength];
+    const UInt16 header_length = encodeReportCommand(header, hid_descriptor, 0x03, raw_type, report_id);
+    const UInt16 capacity = static_cast<UInt16>(header_length + 2 + (report_id != 0) + report_length);
+    UInt8* storage = static_cast<UInt8*>(IOMalloc(capacity));
+    if (!storage)
         return kIOReturnNoMemory;
-    UInt8* orig_buffer = buffer;
-    
-    if (report->readBytes(0, buffer, report_length) != report_length) {
-        IOFree(orig_buffer, report->getLength());
+
+    // Read the descriptor once. Leave room before it for a numbered report
+    // whose caller omitted the ID, then place the header against the payload.
+    UInt8* payload = storage + (capacity - report_length);
+    if (report->readBytes(0, payload, report_length) != report_length) {
+        IOFree(storage, capacity);
         return kIOReturnIOError;
     }
-    if (report_id && report_id == buffer[0]) {
-        buffer++;
-        report_length--;
+    UInt16 wire_size = static_cast<UInt16>(2 + report_length);
+    if (report_id && payload[0] != report_id) {
+        --payload;
+        *payload = report_id;
+        ++wire_size;
     }
-    size = 2 +
-    (report_id ? 1 : 0)     /* reportID */ +
-    report_length     /* buf */;
 
-    arguments_length = (report_id >= 0x0F ? 1 : 0)  /* optional third byte */ +
-    2                                               /* dataRegister */ +
-    size                                            /* args */;
-
-    UInt8* arguments = (UInt8*)IOMalloc(arguments_length);
-    if (!arguments) {
-        IOFree(orig_buffer, report->getLength());
-        return kIOReturnNoMemory;
-    }
-    memset(arguments, 0, arguments_length);
-
-    const UInt8 command_report_id = report_id >= 0x0F ? 0x0F : report_id;
-    if (report_id >= 0x0F)
-        arguments[idx++] = report_id;
-
-    arguments[idx++] = data_register & 0xFF;
-    arguments[idx++] = data_register >> 8;
-
-    arguments[idx++] = size & 0xFF;
-    arguments[idx++] = size >> 8;
-
-    if (report_id)
-        arguments[idx++] = report_id;
-
-    memcpy(&arguments[idx], buffer, report_length);
-
-    UInt16 length = 4;
-
-    VoodooI2CHIDDeviceCommand* command = (VoodooI2CHIDDeviceCommand*)IOMalloc(4 + arguments_length);
-    if (!command) {
-        IOFree(arguments, arguments_length);
-        IOFree(orig_buffer, report->getLength());
-        return kIOReturnNoMemory;
-    }
-    memset(command, 0, 4+arguments_length);
-    command->c.reg = hid_descriptor.wCommandRegister;
-    command->c.opcode = 0x03;
-    command->c.report_type_id = command_report_id | raw_report_type << 4;
-
-    UInt8* raw_command = (UInt8*)command;
-
-    memcpy(raw_command + length, arguments, arguments_length);
-    length += arguments_length;
-    IOReturn ret = api->writeI2C(raw_command, length);
+    UInt8* command = payload - 2 - header_length;
+    memcpy(command, header, header_length);
+    command[header_length] = wire_size & 0xFF;
+    command[header_length + 1] = wire_size >> 8;
+    IOReturn ret = api->writeI2C(command, header_length + wire_size);
     IOSleep(10);
-    IOFree(command, 4+arguments_length);
-    IOFree(arguments, arguments_length);
-    IOFree(orig_buffer, report->getLength());
-
+    IOFree(storage, capacity);
     return ret;
 }
 

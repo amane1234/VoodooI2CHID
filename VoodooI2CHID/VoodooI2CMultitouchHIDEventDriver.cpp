@@ -105,26 +105,22 @@ const char* VoodooI2CMultitouchHIDEventDriver::getProductName() {
 
 void VoodooI2CMultitouchHIDEventDriver::handleInterruptReport(AbsoluteTime timestamp, IOMemoryDescriptor* report, IOHIDReportType report_type, UInt32 report_id) {
     // Touchpad is disabled through ApplePS2Keyboard request
-    if (ignore_all)
+    if (ignore_all || report_type != kIOHIDReportTypeInput || !readyForReports())
         return;
 
     uint64_t now_abs;
     clock_get_uptime(&now_abs);
+    last_multi_touch_event = now_abs;
     uint64_t now_ns;
     absolutetime_to_nanoseconds(now_abs, &now_ns);
-
-    if (report_type == kIOHIDReportTypeInput && readyForReports())
-        clock_get_uptime(&last_multi_touch_event);
 
     // Ignore touchpad interaction(s) shortly after typing
     if (now_ns - key_time < max_after_typing)
         return;
 
-    if (!readyForReports() || report_type != kIOHIDReportTypeInput)
-        return;
-
-    if (digitiser.contact_count && digitiser.contact_count->getValue()) {
-        digitiser.current_contact_count = digitiser.contact_count->getValue();
+    const UInt32 contact_count = digitiser.contact_count ? digitiser.contact_count->getValue() : 0;
+    if (contact_count) {
+        digitiser.current_contact_count = contact_count;
 
         UInt8 finger_count = digitiser.fingers ? digitiser.fingers->getCount() : 0;
 
@@ -246,7 +242,6 @@ void VoodooI2CMultitouchHIDEventDriver::handleDigitizerReport(AbsoluteTime times
 }
 
 void VoodooI2CMultitouchHIDEventDriver::handleDigitizerTransducerReport(VoodooI2CDigitiserTransducer* transducer, AbsoluteTime timestamp, UInt32 report_id) {
-    bool handled = false;
     bool has_confidence = false;
     bool has_valid = false;
     UInt32 element_index = 0;
@@ -267,26 +262,19 @@ void VoodooI2CMultitouchHIDEventDriver::handleDigitizerTransducerReport(VoodooI2
 
     for (element_index=0, element_count=child_elements->getCount(); element_index < element_count; element_index++) {
         IOHIDElement* element;
-        AbsoluteTime element_timestamp;
-        bool element_is_current;
         UInt32 usage_page;
         UInt32 usage;
-        UInt32 value;
 
         element = OSDynamicCast(IOHIDElement, child_elements->getObject(element_index));
 
         if (!element)
             continue;
 
-        element_timestamp = element->getTimeStamp();
-        element_is_current = (element->getReportID() == report_id) && (CMP_ABSOLUTETIME(&timestamp, &element_timestamp) == 0);
-
         transducer->id = report_id;
-        transducer->timestamp = element_timestamp;
+        transducer->timestamp = element->getTimeStamp();
 
         usage_page = element->getUsagePage();
         usage = element->getUsage();
-        value = element->getValue();
 
         switch (usage_page) {
             case kHIDPage_GenericDesktop:
@@ -295,49 +283,41 @@ void VoodooI2CMultitouchHIDEventDriver::handleDigitizerTransducerReport(VoodooI2
                     {
                         transducer->coordinates.x.update(element->getValue(), timestamp);
                         transducer->logical_max_x = element->getLogicalMax();
-                        handled |= element_is_current;
                         break;
                     }
                     case kHIDUsage_GD_Y:
                     {
                         transducer->coordinates.y.update(element->getValue(), timestamp);
                         transducer->logical_max_y = element->getLogicalMax();
-                        handled |= element_is_current;
                         break;
                     }
                     case kHIDUsage_GD_Z:
                     {
                         transducer->coordinates.z.update(element->getValue(), timestamp);
                         transducer->logical_max_z = element->getLogicalMax();
-                        handled |= element_is_current;
                         break;
                     }
                 }
                 break;
             case kHIDPage_Button:
-                setButtonStateForUsage(transducer, usage, value, timestamp);
-                handled |= element_is_current;
+                setButtonStateForUsage(transducer, usage, element->getValue(), timestamp);
                 break;
             case kHIDPage_Digitizer:
                 switch (usage) {
                     case kHIDUsage_Dig_TransducerIndex:
                     case kHIDUsage_Dig_ContactIdentifier:
-                        transducer->secondary_id = value;
-                        handled |= element_is_current;
+                        transducer->secondary_id = element->getValue();
                         break;
                     case kHIDUsage_Dig_Touch:
                     case kHIDUsage_Dig_TipSwitch:
-                        setButtonState(&transducer->tip_switch, 0, value, timestamp);
-                        handled |= element_is_current;
+                        setButtonState(&transducer->tip_switch, 0, element->getValue(), timestamp);
                         break;
                     case kHIDUsage_Dig_InRange:
-                        transducer->in_range = value != 0;
-                        handled |= element_is_current;
+                        transducer->in_range = element->getValue() != 0;
                         break;
                     case kHIDUsage_Dig_Confidence:
                     case kHIDUsage_Dig_Quality:
                         transducer->confidence.update(element->getValue(), timestamp);
-                        handled |= element_is_current;
                         has_confidence = true;
                         break;
                     case kHIDUsage_Dig_TipPressure:
@@ -345,75 +325,58 @@ void VoodooI2CMultitouchHIDEventDriver::handleDigitizerTransducerReport(VoodooI2
                     {
                         transducer->tip_pressure.update(element->getValue(), timestamp);
                         transducer->pressure_physical_max = element->getPhysicalMax();
-                        handled |= element_is_current;
                         break;
                     }
                     case kHIDUsage_Dig_XTilt:
                         transducer->tilt_orientation.x_tilt.update(element->getScaledFixedValue(kIOHIDValueScaleTypePhysical), timestamp);
-                        handled |= element_is_current;
                         break;
                     case kHIDUsage_Dig_YTilt:
                         transducer->tilt_orientation.y_tilt.update(element->getScaledFixedValue(kIOHIDValueScaleTypePhysical), timestamp);
-                        handled |= element_is_current;
                         break;
                     case kHIDUsage_Dig_Azimuth:
                         transducer->azi_alti_orientation.azimuth.update(element->getValue(), timestamp);
-                        handled |= element_is_current;
                         break;
                     case kHIDUsage_Dig_Altitude:
                         transducer->azi_alti_orientation.altitude.update(element->getValue(), timestamp);
-                        handled |= element_is_current;
                         break;
                     case kHIDUsage_Dig_Twist:
                         transducer->azi_alti_orientation.twist.update(element->getScaledFixedValue(kIOHIDValueScaleTypePhysical), timestamp);
-                        handled |= element_is_current;
                         break;
                     case kHIDUsage_Dig_Width:
                         transducer->dimensions.width.update(element->getValue(), timestamp);
-                        handled |= element_is_current;
                         break;
                     case kHIDUsage_Dig_Height:
                         transducer->dimensions.height.update(element->getValue(), timestamp);
-                        handled |= element_is_current;
                         break;
                     case kHIDUsage_Dig_DataValid:
-                        if (value)
-                            transducer->is_valid = true;
-                        else
-                            transducer->is_valid = false;
+                        transducer->is_valid = element->getValue() != 0;
                         has_valid = true;
-                        handled |= element_is_current;
                         break;
                     case kHIDUsage_Dig_BarrelPressure:
                         if (stylus) {
                             stylus->barrel_pressure.update(element->getScaledFixedValue(kIOHIDValueScaleTypeCalibrated), timestamp);
-                            handled |= element_is_current;
                         }
                         break;
                     case kHIDUsage_Dig_BarrelSwitch:
                         if (stylus) {
-                            setButtonState(&stylus->barrel_switch, 1, value, timestamp);
-                            handled |= element_is_current;
+                            setButtonState(&stylus->barrel_switch, 1, element->getValue(), timestamp);
                         }
                         break;
                     case kHIDUsage_Dig_BatteryStrength:
                         if (stylus) {
                             stylus->battery_strength = element->getValue();
-                            handled |= element_is_current;
                         }
                         break;
                     case kHIDUsage_Dig_Eraser:
                         if (stylus) {
+                            const UInt32 value = element->getValue();
                             setButtonState(&stylus->eraser, 2, value, timestamp);
                             stylus->invert = value != 0;
-                            handled |= element_is_current;
                         }
                         break;
                     case kHIDUsage_Dig_Invert:
-                        if (stylus) {
-                            stylus->invert = value != 0;
-                            handled |= element_is_current;
-                        }
+                        if (stylus)
+                            stylus->invert = element->getValue() != 0;
                         break;
                     default:
                         break;
@@ -427,9 +390,6 @@ void VoodooI2CMultitouchHIDEventDriver::handleDigitizerTransducerReport(VoodooI2
 
     if (!has_valid)
         transducer->is_valid = true;
-
-    if (!handled)
-        return;
 }
 
 bool VoodooI2CMultitouchHIDEventDriver::handleStart(IOService* provider) {

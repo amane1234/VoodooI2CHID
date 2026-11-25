@@ -93,7 +93,8 @@ class EXPORT VoodooI2CTouchscreenHIDEventDriver : public VoodooI2CMultitouchHIDE
     IOTimerEventSource *scroll_timer_source;
     
     IOFramebuffer* active_framebuffer;
-    UInt8 current_rotation;
+    UInt8 current_rotation = 0;
+    bool rotation_published = false;
     
     /* transducer variables
      */
