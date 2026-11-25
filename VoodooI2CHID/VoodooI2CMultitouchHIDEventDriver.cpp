@@ -22,7 +22,6 @@
 #define super IOHIDEventService
 OSDefineMetaClassAndStructors(VoodooI2CMultitouchHIDEventDriver, IOHIDEventService);
 
-AbsoluteTime last_multi_touch_event = 0;
 
 // The result is stored in a UInt32 by every caller, so don't squeeze it through an (signed) int
 static UInt32 scientific_pow(UInt32 significand, UInt32 base, SInt32 exponent) {
@@ -110,7 +109,6 @@ void VoodooI2CMultitouchHIDEventDriver::handleInterruptReport(AbsoluteTime times
 
     uint64_t now_abs;
     clock_get_uptime(&now_abs);
-    last_multi_touch_event = now_abs;
     uint64_t now_ns;
     absolutetime_to_nanoseconds(now_abs, &now_ns);
 
@@ -241,6 +239,43 @@ void VoodooI2CMultitouchHIDEventDriver::handleDigitizerReport(AbsoluteTime times
     }
 }
 
+void VoodooI2CMultitouchHIDEventDriver::cacheElements(OSArray* collections) {
+    for (unsigned i = 0; i < collections->getCount(); ++i) {
+        auto* collection = OSDynamicCast(IOHIDElement, collections->getObject(i));
+        OSArray* children = collection ? collection->getChildElements() : nullptr;
+        const unsigned capacity = children ? children->getCount() : 0;
+        if (!capacity)
+            continue;
+        auto* fields = IONew(CachedElement, capacity);
+        if (!fields)
+            continue;
+        auto* layout = IONew(CollectionLayout, 1);
+        if (!layout) {
+            IODelete(fields, CachedElement, capacity);
+            continue;
+        }
+
+        unsigned count = 0;
+        for (unsigned j = 0; j < capacity; ++j) {
+            auto* element = OSDynamicCast(IOHIDElement, children->getObject(j));
+            if (element)
+                fields[count++] = {element, element->getUsagePage(), element->getUsage()};
+        }
+        // digitiser.fingers/styluses own the collections until releaseLayouts().
+        *layout = {collection, fields, capacity, count, layouts};
+        layouts = layout;
+    }
+}
+
+void VoodooI2CMultitouchHIDEventDriver::releaseLayouts() {
+    while (layouts) {
+        auto* layout = layouts;
+        layouts = layout->next;
+        IODelete(layout->fields, CachedElement, layout->capacity);
+        IODelete(layout, CollectionLayout, 1);
+    }
+}
+
 void VoodooI2CMultitouchHIDEventDriver::handleDigitizerTransducerReport(VoodooI2CDigitiserTransducer* transducer, AbsoluteTime timestamp, UInt32 report_id) {
     bool has_confidence = false;
     bool has_valid = false;
@@ -250,9 +285,12 @@ void VoodooI2CMultitouchHIDEventDriver::handleDigitizerTransducerReport(VoodooI2
     if (!transducer->collection)
         return;
 
-    OSArray* child_elements = transducer->collection->getChildElements();
+    auto* layout = layouts;
+    while (layout && layout->collection != transducer->collection)
+        layout = layout->next;
+    OSArray* child_elements = layout ? nullptr : transducer->collection->getChildElements();
 
-    if (!child_elements)
+    if (!layout && !child_elements)
         return;
 
     // Only a real stylus transducer has the stylus-specific members (barrel pressure, eraser, ...).
@@ -260,12 +298,13 @@ void VoodooI2CMultitouchHIDEventDriver::handleDigitizerTransducerReport(VoodooI2
     // whose collection contained e.g. an Eraser/Invert usage had memory beyond its own object overwritten.
     VoodooI2CDigitiserStylus* stylus = OSDynamicCast(VoodooI2CDigitiserStylus, transducer);
 
-    for (element_index=0, element_count=child_elements->getCount(); element_index < element_count; element_index++) {
+    for (element_index=0, element_count=layout ? layout->count : child_elements->getCount(); element_index < element_count; element_index++) {
         IOHIDElement* element;
         UInt32 usage_page;
         UInt32 usage;
 
-        element = OSDynamicCast(IOHIDElement, child_elements->getObject(element_index));
+        const CachedElement* cached = layout ? &layout->fields[element_index] : nullptr;
+        element = cached ? cached->element : OSDynamicCast(IOHIDElement, child_elements->getObject(element_index));
 
         if (!element)
             continue;
@@ -273,8 +312,8 @@ void VoodooI2CMultitouchHIDEventDriver::handleDigitizerTransducerReport(VoodooI2
         transducer->id = report_id;
         transducer->timestamp = element->getTimeStamp();
 
-        usage_page = element->getUsagePage();
-        usage = element->getUsage();
+        usage_page = cached ? cached->page : element->getUsagePage();
+        usage = cached ? cached->usage : element->getUsage();
 
         switch (usage_page) {
             case kHIDPage_GenericDesktop:
@@ -429,6 +468,7 @@ bool VoodooI2CMultitouchHIDEventDriver::handleStart(IOService* provider) {
     // handleStop() is NOT called when handleStart() fails, so everything created below has to be
     // released here on the failure paths (the multitouch interface used to stay published forever).
     auto cleanup = [this]() {
+        releaseLayouts();
         if (multitouch_interface) {
             multitouch_interface->stop(this);
             multitouch_interface->detach(this);
@@ -461,6 +501,9 @@ bool VoodooI2CMultitouchHIDEventDriver::handleStart(IOService* provider) {
         cleanup();
         return false;
     }
+
+    cacheElements(digitiser.fingers);
+    cacheElements(digitiser.styluses);
 
     if (!hid_interface->open(this, 0, OSMemberFunctionCast(IOHIDInterface::InterruptReportAction, this, &VoodooI2CMultitouchHIDEventDriver::handleInterruptReport), NULL)) {
         cleanup();
@@ -495,6 +538,7 @@ void VoodooI2CMultitouchHIDEventDriver::handleStop(IOService* provider) {
 
     OSSafeReleaseNULL(work_loop);
 
+    releaseLayouts();
     OSSafeReleaseNULL(digitiser.transducers);
     OSSafeReleaseNULL(digitiser.wrappers);
     OSSafeReleaseNULL(digitiser.styluses);

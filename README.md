@@ -12,13 +12,11 @@ In polling mode, `simulateInterrupt()` reads the device on a timer:
 
 | State | Interval |
 |---|---|
-| Touch activity | 2 ms (`INTERRUPT_SIMULATOR_TIMEOUT_BUSY`) |
-| No activity seen yet | 5 ms (`INTERRUPT_SIMULATOR_TIMEOUT`) |
-| No activity for 1.5 s | 50 ms (`INTERRUPT_SIMULATOR_TIMEOUT_IDLE`) |
+| Reset pending or changed report in the last 250 ms | 2 ms |
+| Starting up or less than 1.5 s idle | 5 ms |
+| At least 1.5 s idle | 50 ms |
 
-The decision uses `last_multi_touch_event`, and upstream only `VoodooI2CMultitouchHIDEventDriver` updates it. With other event drivers, such as AlpsHID, it stays `0`, so polling reads the device every 5 ms forever. On a Dell Comet Lake-U with an Alps touchpad this was about 2,000 I2C controller interrupts per second while idle.
-
-`getInputReport()` now treats an input report whose content changed as touch activity and updates `last_multi_touch_event`. Empty reports are skipped before that point, so polling backs off to 50 ms after 1.5 s without new reports. The first touch after a long idle period can be up to 50 ms late; after that the interval returns to 2 ms.
+Each polling device compares its complete report with its own previous report. Unchanged valid reports are still delivered. The first input after a long idle can wait up to one polling interval. Hardware-interrupt devices skip the history allocation and comparison. Input transfers reuse device-owned storage. Each delivered descriptor has separate storage so clients can retain it.
 
 ### Fixes
 

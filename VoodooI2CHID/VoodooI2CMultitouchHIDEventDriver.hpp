@@ -330,6 +330,22 @@ class EXPORT VoodooI2CMultitouchHIDEventDriver : public IOHIDEventService {
      * @notifier IONotifier object for the notification registration
      */
     bool notificationHIDAttachedHandler(void * refCon, IOService * newService, IONotifier * notifier);
+
+    struct CachedElement {
+        IOHIDElement* element;
+        UInt32 page;
+        UInt32 usage;
+    };
+    struct CollectionLayout {
+        IOHIDElement* collection;
+        CachedElement* fields;
+        unsigned capacity;
+        unsigned count;
+        CollectionLayout* next;
+    };
+    CollectionLayout* layouts = nullptr;
+    void cacheElements(OSArray* collections);
+    void releaseLayouts();
 };
 
 

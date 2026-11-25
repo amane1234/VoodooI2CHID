@@ -327,6 +327,14 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
     void startInterrupt();
 
     void stopInterrupt();
+
+    IOBufferMemoryDescriptor* input_storage = nullptr;
+    IOBufferMemoryDescriptor* previous_input = nullptr;
+    UInt16 input_capacity = 0;
+    UInt16 previous_length = 0;
+    AbsoluteTime polling_activity = 0;
+    unsigned input_generation = 0;
+    bool input_read_active = false;
 };
 
 

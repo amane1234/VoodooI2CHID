@@ -14,7 +14,6 @@
 #define super IOHIDDevice
 OSDefineMetaClassAndStructors(VoodooI2CHIDDevice, IOHIDDevice);
 
-extern volatile AbsoluteTime last_multi_touch_event;
 
 bool VoodooI2CHIDDevice::init(OSDictionary* properties) {
     if (!super::init(properties))
@@ -124,72 +123,46 @@ void VoodooI2CHIDDevice::getInputReport() {
     // Recheck inside the work-loop gate, including callbacks queued before sleep.
     if (!awake && !reset_pending)
         return;
-    IOBufferMemoryDescriptor* buffer;
-    IOReturn ret;
-    if (hid_descriptor.wMaxInputLength < 2)
+    if (!input_storage || input_read_active)
         return;
 
-    unsigned char* report = (unsigned char *)IOMalloc(hid_descriptor.wMaxInputLength);
-    if (!report)
+    // A controller wait can open a shared work-loop gate. Keep the buffer
+    // alive and discard the read if sleep or teardown intervened.
+    auto* storage = input_storage;
+    storage->retain();
+    UInt8* report = static_cast<UInt8*>(storage->getBytesNoCopy());
+    const unsigned generation = input_generation;
+    input_read_active = true;
+    IOReturn read_result = api->readI2C(report, input_capacity);
+    input_read_active = false;
+    storage->release();
+    if (read_result != kIOReturnSuccess || generation != input_generation)
         return;
 
-    int return_size;
-    if (api->readI2C(report, hid_descriptor.wMaxInputLength) != kIOReturnSuccess)
-        goto exit;
+    const UInt16 length = report[0] | (report[1] << 8);
+    if (!length && reset_pending) {
+        reset_pending = false;
+        command_gate->commandWakeup(&reset_pending);
+    }
+    if (!ready_for_input || length <= 2 || length > input_capacity)
+        return;
 
-    return_size = report[0] | report[1] << 8;
-
-    if (!return_size) {
-        // IOLog("%s::%s Device sent a 0-length report\n", getName(), name);
-        if (reset_pending) {
-            reset_pending = false;
-            command_gate->commandWakeup(&reset_pending);
-        }
-        goto exit;
+    if (previous_input && (length != previous_length || memcmp(previous_input->getBytesNoCopy(), report, length))) {
+        clock_get_uptime(&polling_activity);
+        previous_length = length;
+        input_storage = previous_input;
+        previous_input = storage;
     }
 
-    if (!ready_for_input)
-        goto exit;
-
-    if (return_size <= 2 || return_size > hid_descriptor.wMaxInputLength) {
-        // IOLog("%s: Incomplete report %d/%d\n", getName(), hid_descriptor.wMaxInputLength, return_size);
-        goto exit;
-    }
-
-    /*
-     * Polling idle back-off for event drivers that do not update
-     * last_multi_touch_event themselves (e.g. AlpsHID). Treat a report whose
-     * content changed as touch activity, so simulateInterrupt() can drop to
-     * INTERRUPT_SIMULATOR_TIMEOUT_IDLE after 1.5 s without changes instead of
-     * reading every INTERRUPT_SIMULATOR_TIMEOUT ms forever.
-     */
-    {
-        static UInt8 poll_last[64];
-        static int poll_last_len = 0;
-        int n = return_size < (int)sizeof(poll_last) ? return_size : (int)sizeof(poll_last);
-        if (n != poll_last_len || memcmp(poll_last, report, n) != 0) {
-            AbsoluteTime poll_now;
-            clock_get_uptime(&poll_now);
-            last_multi_touch_event = poll_now;
-            memcpy(poll_last, report, n);
-            poll_last_len = n;
-        }
-    }
-
-    buffer = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, 0, return_size - 2);
+    // Clients can retain a delivered descriptor beyond handleReport(). Give
+    // each valid report independent storage; empty polls need no allocation.
+    auto* buffer = IOBufferMemoryDescriptor::withBytes(report + 2, length - 2, kIODirectionNone);
     if (!buffer)
-        goto exit;
-    buffer->writeBytes(0, report + 2, return_size - 2);
-
-    ret = handleReport(buffer, kIOHIDReportTypeInput);
-
+        return;
+    IOReturn ret = handleReport(buffer, kIOHIDReportTypeInput);
     if (ret != kIOReturnSuccess)
         IOLog("%s::%s Error handling input report: 0x%.8x\n", getName(), name, ret);
-
-    OSSafeReleaseNULL(buffer);
-exit:
-    IOFree(report, hid_descriptor.wMaxInputLength);
-    return;
+    buffer->release();
 }
 
 IOReturn VoodooI2CHIDDevice::getReport(IOMemoryDescriptor* report, IOHIDReportType reportType, IOOptionBits options) {
@@ -254,10 +227,9 @@ IOReturn VoodooI2CHIDDevice::getReportGated(IOMemoryDescriptor* report, IOHIDRep
 }
 
 void VoodooI2CHIDDevice::interruptOccured(OSObject* owner, IOInterruptEventSource* src, int intCount) {
-    if (!awake && !reset_pending)
-        return;
-
-    command_gate->runAction(OSMemberFunctionCast(IOCommandGate::Action, this, &VoodooI2CHIDDevice::getInputReport));
+    // The interrupt source and command gate are attached to the same work loop.
+    if (is_interrupt_started)
+        getInputReport();
 }
 
 VoodooI2CHIDDevice* VoodooI2CHIDDevice::probe(IOService* provider, SInt32* score) {
@@ -320,6 +292,8 @@ void VoodooI2CHIDDevice::releaseResources() {
             command_gate->getWorkLoop()->removeEventSource(command_gate);
         OSSafeReleaseNULL(command_gate);
     }
+    OSSafeReleaseNULL(input_storage);
+    OSSafeReleaseNULL(previous_input);
     OSSafeReleaseNULL(work_loop);
     OSSafeReleaseNULL(acpi_device);
     if (api) {
@@ -514,9 +488,9 @@ IOReturn VoodooI2CHIDDevice::setPowerStateGated(unsigned long whichState) {
         return kIOReturnSuccess;
 
     ready_for_input = false;
-    startInterrupt(); // RESET completion needs interrupts or polling enabled.
     if (quirks & I2C_HID_QUIRK_DELAY_WAKEUP_AFTER_RESUME)
         IOSleep(1500);
+    startInterrupt(); // Arm input after the firmware delay, before RESET.
     IOReturn ret = (quirks & I2C_HID_QUIRK_RESET_ON_RESUME) ?
         resetHIDDeviceGated() : setHIDPowerState(kVoodooI2CStateOn);
     if (ret != kIOReturnSuccess) {
@@ -573,6 +547,17 @@ bool VoodooI2CHIDDevice::handleStart(IOService* provider) {
             IOLog("%s::%s Could not attach polling timer\n", getName(), name);
             goto exit;
         }
+    }
+    input_capacity = hid_descriptor.wMaxInputLength;
+    if (input_capacity < 2)
+        goto exit;
+    input_storage = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, 0, input_capacity);
+    if (!input_storage)
+        goto exit;
+    if (interrupt_simulator) {
+        previous_input = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, 0, input_capacity);
+        if (!previous_input)
+            goto exit;
     }
     startInterrupt();
 
@@ -686,28 +671,20 @@ OSString* VoodooI2CHIDDevice::newManufacturerString() const {
 void VoodooI2CHIDDevice::simulateInterrupt(OSObject* owner, IOTimerEventSource* timer) {
     if (!is_interrupt_started)
         return;
-    AbsoluteTime prev_time = last_multi_touch_event;
-    if (awake || reset_pending) {
-        VoodooI2CHIDDevice::getInputReport();
-    }
-
-    if (last_multi_touch_event == 0) {
-        interrupt_simulator->setTimeoutMS(INTERRUPT_SIMULATOR_TIMEOUT);
+    getInputReport();
+    if (!is_interrupt_started)
         return;
-    }
 
-    IOSleep(1);
-    if (last_multi_touch_event != prev_time) {
-        interrupt_simulator->setTimeoutMS(INTERRUPT_SIMULATOR_TIMEOUT_BUSY);
-        return;
-    }
-
-    uint64_t        nsecs;
-    AbsoluteTime    cur_time;
-    clock_get_uptime(&cur_time);
-    SUB_ABSOLUTETIME(&cur_time, &last_multi_touch_event);
-    absolutetime_to_nanoseconds(cur_time, &nsecs);
-    interrupt_simulator->setTimeoutMS((nsecs > 1500000000) ? INTERRUPT_SIMULATOR_TIMEOUT_IDLE : INTERRUPT_SIMULATOR_TIMEOUT_BUSY);
+    AbsoluteTime now;
+    UInt64 idle_ns;
+    clock_get_uptime(&now);
+    absolutetime_to_nanoseconds(now - polling_activity, &idle_ns);
+    unsigned interval = INTERRUPT_SIMULATOR_TIMEOUT;
+    if (reset_pending || (previous_length && idle_ns < 250000000ULL))
+        interval = INTERRUPT_SIMULATOR_TIMEOUT_BUSY;
+    else if (idle_ns >= 1500000000ULL)
+        interval = INTERRUPT_SIMULATOR_TIMEOUT_IDLE;
+    timer->setTimeoutMS(interval);
 }
 
 bool VoodooI2CHIDDevice::open(IOService *forClient, IOOptionBits options, void *arg) {
@@ -749,14 +726,15 @@ void VoodooI2CHIDDevice::startInterrupt() {
     }
 
     if (interrupt_simulator) {
+        previous_length = 0;
+        clock_get_uptime(&polling_activity);
+        is_interrupt_started = true;
         interrupt_simulator->enable();
-        interrupt_simulator->setTimeoutMS(200);
+        interrupt_simulator->setTimeoutMS(INTERRUPT_SIMULATOR_TIMEOUT);
     } else if (interrupt_source) {
+        is_interrupt_started = true;
         interrupt_source->enable();
-    } else {
-        return;
     }
-    is_interrupt_started = true;
 }
 
 void VoodooI2CHIDDevice::stopInterrupt() {
@@ -764,11 +742,12 @@ void VoodooI2CHIDDevice::stopInterrupt() {
         return;
     }
 
+    ++input_generation;
+    is_interrupt_started = false;
     if (interrupt_simulator) {
         interrupt_simulator->cancelTimeout();
         interrupt_simulator->disable();
     } else if (interrupt_source) {
         interrupt_source->disable();
     }
-    is_interrupt_started = false;
 }
